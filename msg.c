@@ -233,7 +233,8 @@ static json_t *get_work(const char *auth_user)
 {
 	char s[80];
 	unsigned char data[128];
-	const char *data_str;
+	unsigned char target[32];
+	const char *data_str, *target_str;
 	json_t *val, *result;
 
 	sprintf(s, "{\"method\": \"getwork\", \"params\": [], \"id\":%u}\r\n",
@@ -258,6 +259,18 @@ static json_t *get_work(const char *auth_user)
 		/* store two most recently seen prevhash (last, and current) */
 		memcpy(srv.last_prevhash, srv.cur_prevhash, sizeof(srv.last_prevhash));
 		memcpy(srv.cur_prevhash, data + 4, sizeof(srv.cur_prevhash));
+
+                target_str = json_string_value(json_object_get(result, "target"));
+                if (!target_str ||
+                    !hex2bin(target, target_str, sizeof(target))) {
+                        json_decref(val);
+                        return NULL;
+                }
+                memcpy(srv.cur_target, target, sizeof(srv.cur_target));
+                if (debugging > 0)
+                        applog(LOG_INFO, "new block, target %s", target_str);
+                srv.initiate_lp_flush = true;
+                event_loopbreak();
 	}
 
 	/* log work unit as having been sent to associated worker */
@@ -315,7 +328,32 @@ json_decref(val);
 return;
 }
 
+static int hash_greater_target(const unsigned char *hash, const unsigned char *target, short type)
+{
+        uint32_t *hash32 = (uint32_t *) hash;
+        uint32_t *target32 = (uint32_t *) target;
+        int i;
 
+	printf("%s target: ", type?"curr":"easy");
+        for (i = 7; i >= 0; i--) {
+	    printf("%08x", target32[i]);
+	}
+	printf(" hash: ");
+        for (i = 7; i >= 0; i--) {
+	    printf("%08x", hash32[i]);
+	}
+	printf("\n");
+
+        /* this is NOT endian-clean */
+        for (i = 7; i >= 0; i--) {
+                if (hash32[i] > target32[i])
+                        return 1;
+                //shortcut
+                if (hash32[i] < target32[i])
+                        return 0;
+        }
+        return 0;
+}
 
 static int check_hash(const char *remote_host, const char *auth_user,
 		      const char *data_str, const char **reason_out)
@@ -350,12 +388,14 @@ static int check_hash(const char *remote_host, const char *auth_user,
 	    SHA256(hash1, SHA256_DIGEST_LENGTH, hash);
     }
 
-	if (hash32[7] != 0) {
-		*reason_out = "H-not-zero";
-		return 0;		/* work is invalid */
-	}
-	if (hash[27] == 0)
-		better_hash = true;
+        if (srv.easy_target) {
+                if (hash_greater_target(hash, srv.easy_target_bin, 0)) {
+                        *reason_out = "target-miss";
+                        return 0;                /* work is invalid */
+                }
+                if(! hash_greater_target(hash, srv.cur_target, 1))
+                        better_hash = true;
+        }
 
 	if (hist_lookup(srv.hist, hash)) {
 		*reason_out = "duplicate";
@@ -424,7 +464,10 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 	json_decref(val);
 
 	if (!*reason)
+	{
 		applog(LOG_INFO, "PROOF-OF-WORK found");
+		event_loopbreak();
+	}
 
 	/* if pool server mode, return success even if result==false */
 	if (srv.easy_target)
